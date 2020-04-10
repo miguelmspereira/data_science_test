@@ -1,0 +1,283 @@
+---
+title: "Data science/ML test"
+author: "Miguel Pereira"
+date: "10 April 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Import packages
+library(data.table)
+library(caret)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+library(tidyverse)
+library(kableExtra)
+library(pROC)
+library(magrittr)
+
+
+```
+
+# Introduction
+
+This document describes the approach taken to build a model to predict the presence of heart disease. It uses the processed Cleveleand dataset where the outcome is a classification of whether the patient has heart disease (values 1,2,3,4) or not (value 0). I will approach this problem as binary classification problem (presence vs. absence of heart disease and will use the other variables provided as predictors).
+In addition, I will take a supervised learning approach to build a predictive model.
+
+The following document is organised as follows:
+
+1. Descriptive statistics
+2. Statistical Modelling
+3. Model interpretation and concluding remarks
+
+
+## Descriptive statistics
+
+First, the data will be loaded and I will see how the outcome is distributed across the 5 categories.
+The dataset has ```{r} nrow(data)``` observations (patients) and 14 variables, including the outcome.
+
+Below i a table with the counts of per each outcome class and a table with the counts per class after converting the outcome to a binary variable (0 vs. 1,2,3,4, absense vs. presence of heart disease):
+
+```{r dataset_prep, echo=FALSE, warning=FALSE}
+#Load dataset
+data<-as.data.frame(fread('processed.cleveland.data',na.strings = '?'))
+#head(data) #columns have no names
+
+#---Change column names according to the documentation
+#Only 14 attributes used:
+#1. #3 (age)
+#2. #4 (sex)
+#3. #9 (cp)
+#4. #10 (trestbps)
+#5. #12 (chol)
+#6. #16 (fbs)
+#7. #19 (restecg)
+#8. #32 (thalach)
+#9. #38 (exang)
+#10. #40 (oldpeak)
+#11. #41 (slope)
+#12. #44 (ca)
+#13. #51 (thal)
+#14. #58 (num) (the predicted attribute) 
+
+colnames(data)<-c('age','sex','cp','trestbps','chol','fbs','restecg','thalach','exang',
+                  'oldpeak','slope','ca','thal','outcome')
+
+
+#Variable types - converting to the variable types needed for the predictive modelling
+numeric.vars<-c('age','trestbps','chol','thalach','oldpeak','slope','ca')
+factor.vars<-c('sex','cp','fbs','restecg','exang','thal')
+data[,numeric.vars] <- lapply(data[,numeric.vars],as.numeric)
+data[,factor.vars] <- lapply(data[,factor.vars],factor)
+
+
+#Creating a binary outcome variable
+outcome.bin<-data$outcome
+outcome.bin[which(data$outcome>0)]<-1
+
+data<-cbind(data,as.factor(outcome.bin))
+colnames(data)[15]<-'outcome.bin'
+
+
+#Tables
+#head(data) %>%
+#  kable("html", row.names = FALSE) %>%
+#  kable_styling(position = "left", full_width = FALSE)
+
+summary(data) %>%
+  kable("html", row.names = FALSE) %>%
+  kable_styling(position = "left", full_width = FALSE)
+
+table(data$outcome,useNA = 'ifany') %>%
+  kable("html", row.names = FALSE, col.names  = c('Class','Freq'),caption = 'Counts per class') %>%
+  kable_styling(position = "left", full_width = FALSE)
+
+table(outcome.bin,useNA = 'ifany') %>%
+  kable("html", row.names = FALSE, col.names =  c('Class','Freq'),caption = 'Counts per class after converting to binary outcome') %>%
+  kable_styling(position = "left", full_width = FALSE)
+  
+  
+
+
+```
+
+
+From this data it can be seen that the binary outcome is fairly balanced with %%% of patients with heart disease.
+The variable ```restecg``` has only 4 subjects with category 1. Given that both categories 1 and 2 mean abnomral changes in the ECG, I will group them in one single category.
+Also, the summary of the variables shows that the data is very complete with the variables ```ca``` and ```thal``` having 4 and 2 missing values, respectively. The other variables do not have any missing values.
+```{r dataset_prep2, echo=FALSE, warning=FALSE}
+
+#Changing the variable restecg to 2 categories
+data$restecg<-factor(ifelse(data$restecg==0,0,1))
+
+```
+
+### Box plots of continuous variables by presense of heart disease
+
+```{r boxplots_num, echo=FALSE, warning=F}
+
+for(i in numeric.vars){
+  print(ggplot(data,aes_string(x='outcome.bin',y=paste0(i),col='outcome.bin'))+
+    geom_boxplot(show.legend = FALSE)  +
+    geom_jitter(width = 0.3, show.legend = FALSE, alpha=0.5) +
+    xlab("Heart disease") + ylab(paste0(i)) + ggtitle(paste0(i)))
+}
+
+```
+
+
+### Bar plots of categorical variables by presense of heart disease
+
+```{r boxplots_factor, echo=FALSE, warning=F}
+
+for(i in factor.vars){
+  print(ggplot(data,aes_string(x=paste0(i),fill='outcome.bin'))+
+    geom_bar()  + xlab("Heart disease") + ylab("Count")+
+    ggtitle(paste0(i))
+    )
+    
+}
+
+```
+
+
+## Statistical Modelling
+
+### Dataset preparation
+
+The goal do this exercise is to create a predictive model of heart disease based on the 13 predictors provided. The ideal model will fit the data well while ensuring generalisability to other datasets. With this purpose, I will split the dataset in two parts: a training set (70% of the data) and a test set (30% of the data). The training set will be used to build the model and the test set will be used for external validation. The split will be done such that the proportion of patients with and without heart disease is the same in the two sets.
+In addition, the data matrix wil be transformed by creating dummy variables for the factor variables with more than two cagories.
+
+
+```{r train_test_split, echo=FALSE, warnings=FALSE,cache=TRUE}
+#Matrix with dummy variables
+preds0<-data %>% select(-outcome)
+
+options(na.action="na.pass")
+preds<-model.matrix(~.,preds0)[,-1] #creates the matrix with the predictors and removes the intercept
+
+#Train-test split
+set.seed(12532)
+train.rows<- createDataPartition(y=outcome.bin, p=0.7, list=FALSE, times=1)
+
+#Train-test sets
+train <- data.frame(preds[train.rows,])
+test <- data.frame(preds[-train.rows,])
+
+cbind(table(train$outcome.bin),table(test$outcome.bin),table(data$outcome.bin)) %>%
+  kable("html", row.names = FALSE,col.names = c('Training set','Test set','Original data'),caption='Number of patients per outcome category after train-test split') %>%
+  kable_styling(position = "left", full_width = FALSE)
+
+
+```
+
+
+### Predictive modelling
+
+For this exercise, I will fit two models to the training set and test their performance in the test set:
+
+1. Elastic net, a linear model that uses regularised regression. The number of patients is larger than the number of predictors but regularisation will be useful to select the important predictors.
+2. Support Vector Machines with a radial kernel, a non-linear approach which is useful if there are non-linear relationships between the outcome and predictors.
+
+For both models, accuracy will be used to assess model performance. All the predictors will be standardised and the missing values will be imputed using the k-nearest neighbors (KNN) method.
+For hyperparameter tuning during training, I will use 10-fold cross-validation and 10 repeats. This something that can be explored in a more in-depth analysis but for conciseness, I will use these parameters.
+
+
+#### Elastic Net
+
+A model was built using the `caret` package and the variable importance is displayed below.
+
+```{r elastic_net, echo=FALSE, warnings=FALSE,cache=TRUE}
+
+enet<-train(x=train %>% select(-outcome.bin1),
+            y=factor(train$outcome.bin1),
+            method="glmnet",
+            metric="Accuracy",
+            preProcess = c("center", "scale",'knnImpute'),
+            trControl = trainControl(method="repeatedcv", number=10,
+                                                     repeats=10, savePredictions =
+                                                       TRUE), tuneLength = 10)
+
+
+paste('The mean model accuracy is ',round(mean(enet$resample$Accuracy),2),sep='')
+
+
+
+
+```
+
+#### Support Vector Machines with a radial kernel
+
+```{r svm, echo=FALSE,cache=TRUE}
+
+svm<-train(x=train %>% select(-outcome.bin1),
+            y=factor(train$outcome.bin1),
+            method="svmRadial",
+            metric="Accuracy",
+            preProcess = c("center", "scale",'knnImpute'),
+            trControl = trainControl(method="repeatedcv", number=10,
+                                                     repeats=10, savePredictions =
+                                                       TRUE), tuneLength = 10)
+
+paste('The mean model accuracy is ',round(mean(svm$resample$Accuracy),2),sep='')
+
+
+#Variable importance - Elastic Net and SVM
+enet.varImp<-ggplot(data= varImp(enet, scale = FALSE), aes(x=rownames(varImp(enet, scale = FALSE)),y=Overall)) +
+  geom_bar(position="dodge",stat="identity",width = 0, color = "black") + 
+  coord_flip() + geom_point(color='skyblue') + xlab(" Importance Score")+
+  ggtitle("Elastic Net - Variable Importance") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+svm.varImp<-ggplot(data= varImp(svm, scale = FALSE), aes(x=rownames(varImp(svm, scale = FALSE)),y=Overall)) +
+  geom_bar(position="dodge",stat="identity",width = 0, color = "black") + 
+  coord_flip() + geom_point(color='skyblue') + xlab(" Importance Score")+
+  ggtitle("SVM  radial kernel - Variable Importance") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(enet.varImp, svm.varImp, ncol = 2)
+
+```
+
+
+### Model performance
+
+In this exercise, accuracy was used as the performance memasure for model selection during training. In order to access the performance of the model in the test set, I will also calculate accuracy in the test set and evaluate the AUC.
+
+The following table shows the 
+
+```{r perf_table, echo=FALSE,cache=TRUE}
+
+
+
+```
+
+
+### Variable importance plots
+
+Below are the variable importance plots with the variables ordered from most important to least important in both models. For elastic net, it is also possible to see the variables that were left out by the best model.
+
+```{r varImp_plots, echo=FALSE,cache=TRUE}
+
+#Variable importance - Elastic Net and SVM
+enet.varImp<-ggplot(data= varImp(enet, scale = FALSE), aes(x=rownames(varImp(enet, scale = FALSE)),y=Overall)) +
+  geom_bar(position="dodge",stat="identity",width = 0, color = "black") + 
+  coord_flip() + geom_point(color='skyblue') + xlab(" Importance Score")+
+  ggtitle("Elastic Net - Variable Importance") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+svm.varImp<-ggplot(data= varImp(svm, scale = FALSE), aes(x=rownames(varImp(svm, scale = FALSE)),y=Overall)) +
+  geom_bar(position="dodge",stat="identity",width = 0, color = "black") + 
+  coord_flip() + geom_point(color='skyblue') + xlab(" Importance Score")+
+  ggtitle("SVM  radial kernel - Variable Importance") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(enet.varImp, svm.varImp, ncol = 2)
+
+```
+
+
+
